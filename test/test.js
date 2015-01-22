@@ -54,7 +54,7 @@ describe('upsert', function () {
       }
     }, 'foo', function () {
       return false;
-    }).should.become('lalala');
+    }).should.be.fulfilled;
   });
   it('should error if it can\'t put', function () {
     return upsert({
@@ -673,16 +673,17 @@ function tests(dbName, dbType, viewType) {
         }).then(function (queryFun) {
           return db.bulkDocs({
             docs: [
-              { val: 2 },
-              { val: [1, 2, 3, 4] },
-              { val: [3, 4] }
+              { _id: '1', val: 2 },
+              { _id: '2', val: [1, 2, 3, 4] },
+              { _id: '3', val: [3, 4] },
+              { _id: '4', val: 1 }
             ]
           }).then(function () {
             return db.query(queryFun, {reduce: true, group: true});
           }).then(function (res) {
             res.should.deep.equal({rows : [{
               key : null,
-              value : [6, 6, 3, 4]
+              value : [7, 6, 3, 4]
             }]});
           });
         });
@@ -1093,6 +1094,51 @@ function tests(dbName, dbType, viewType) {
           });
         }).should.be.rejected;
       });
+
+      it('many simultaneous persisted views', function () {
+        this.timeout(30000);
+        var db = new Pouch(dbName);
+
+        var views = [];
+        var doc = {_id: 'foo'};
+        for (var i = 0; i < 40; i++) {
+          views.push('foo_' + i);
+          doc['foo_' + i] = 'bar_' + i;
+        }
+
+        return db.put(doc).then(function () {
+          return Promise.all(views.map(function (_, i) {
+            var fun = "function (doc) { emit(doc.foo_" + i + ");}";
+
+            var ddocId = 'theViewDoc_' + i;
+            var ddoc = {
+              _id: '_design/' + ddocId,
+              views: {
+                theView : {map: fun}
+              }
+            };
+
+            return db.put(ddoc).then(function (res) {
+              ddoc._rev = res.rev;
+              return db.query(ddocId + '/theView');
+            }).then(function (res) {
+              res.rows.should.have.length(1);
+              res.rows[0].key.should.equal('bar_' + i);
+              res.rows[0].id.should.equal('foo');
+              return db.remove(ddoc);
+            }).then(function () {
+              return db.viewCleanup();
+            }).then(function () {
+              return db.query(ddocId + '/theView').then(function () {
+                throw new Error('view should have been deleted');
+              }, function (err) {
+                should.exist(err);
+              });
+            });
+          }));
+        });
+      });
+
     }
 
     it("Special document member _doc_id_rev should never leak outside", function () {
@@ -1497,6 +1543,151 @@ function tests(dbName, dbType, viewType) {
           }).then(function (data) {
             data.rows.map(ids).should.deep.equal(spec);
           });
+        });
+      });
+    });
+
+    it('#238 later non-winning revisions', function () {
+      var db = new Pouch(dbName);
+
+      return createView(db, {
+        map: function (doc) {
+          emit(doc.name);
+        }
+      }).then(function (mapFun) {
+        return db.bulkDocs([{
+          _id: 'doc',
+          name: 'zoot',
+          _rev: '2-x',
+          _revisions: {
+            start: 2,
+            ids: ['x', 'y']
+          }
+        }], {new_edits: false}).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zoot');
+          return db.bulkDocs([{
+            _id: 'doc',
+            name: 'suit',
+            _rev: '2-w',
+            _revisions: {
+              start: 2,
+              ids: ['w', 'y']
+            }
+          }], {new_edits: false});
+        }).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zoot');
+        });
+      });
+    });
+
+    it('#238 later non-winning deleted revisions', function () {
+      var db = new Pouch(dbName);
+
+      return createView(db, {
+        map: function (doc) {
+          emit(doc.name);
+        }
+      }).then(function (mapFun) {
+        return db.bulkDocs([{
+          _id: 'doc',
+          name: 'zoot',
+          _rev: '2-x',
+          _revisions: {
+            start: 2,
+            ids: ['x', 'y']
+          }
+        }], {new_edits: false}).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zoot');
+          return db.bulkDocs([{
+            _id: 'doc',
+            name: 'suit',
+            _deleted: true,
+            _rev: '2-z',
+            _revisions: {
+              start: 2,
+              ids: ['z', 'y']
+            }
+          }], {new_edits: false});
+        }).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zoot');
+        });
+      });
+    });
+
+    it('#238 query with conflicts', function () {
+      var db = new Pouch(dbName);
+
+      return createView(db, {
+        map: function (doc) {
+          emit(doc.name);
+        }
+      }).then(function (mapFun) {
+        return db.bulkDocs([
+
+          {
+            _id: 'doc',
+            name: 'zab',
+            _rev: '2-y',
+            _revisions: {
+              start: 1,
+              ids: ['y']
+            }
+          }, {
+            _id: 'doc',
+            name: 'zoot',
+            _rev: '2-x',
+            _revisions: {
+              start: 2,
+              ids: ['x', 'y']
+            }
+          }
+        ], {new_edits: false}).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zoot');
+          return db.bulkDocs([
+            {
+              _id: 'doc',
+              name: 'suit',
+              _rev: '2-w',
+              _revisions: {
+                start: 2,
+                ids: ['w', 'y']
+              }
+            }, {
+              _id: 'doc',
+              name: 'zorb',
+              _rev: '2-z',
+              _revisions: {
+                start: 2,
+                ids: ['z', 'y']
+              }
+            }
+          ], {new_edits: false});
+        }).then(function () {
+          return db.query(mapFun);
+        }).then(function (res) {
+          res.rows.should.have.length(1);
+          res.rows[0].id.should.equal('doc');
+          res.rows[0].key.should.equal('zorb');
         });
       });
     });
@@ -3050,5 +3241,105 @@ function tests(dbName, dbType, viewType) {
         });
       });
     }
+
+    var isNode = typeof window === 'undefined';
+    if (viewType === 'persisted' && dbType === 'local' && isNode) {
+      it('#239 test memdown db', function () {
+        var destroyedDBs = [];
+        Pouch.on('destroyed', function (db) {
+          destroyedDBs.push(db);
+        });
+
+        // make sure prefixed DBs are tied to regular DBs
+        var db = new Pouch(dbName, {db: require('memdown')});
+        return utils.fin(createView(db, {
+          map: function (doc) {
+            emit(doc.name);
+          }
+        }).then(function (queryFun) {
+          return db.post({name: 'foo'}).then(function () {
+            return db.query(queryFun);
+          }).then(function (res) {
+            res.rows.should.have.length(1);
+            res.rows[0].key.should.equal('foo');
+            var ddocId = '_design/' + queryFun.split('/')[0];
+            return db.get(ddocId);
+          }).then(function (ddoc) {
+            return db.remove(ddoc);
+          }).then(function () {
+            return db.viewCleanup();
+          });
+        }), function () {
+          return db.destroy().then(function () {
+            var chain = Pouch.utils.Promise.resolve();
+            // for each of the supposedly destroyed DBs,
+            // check that there isn't a normal DB hanging around
+            destroyedDBs.forEach(function (dbName) {
+              chain = chain.then(function () {
+                var db = new Pouch(dbName);
+                var promise = db.info().then(function (info) {
+                  info.update_seq.should.equal(0);
+                });
+                return utils.fin(promise, function () {
+                  return db.destroy();
+                });
+              });
+            });
+            return chain;
+          }).then(function () {
+            Pouch.removeAllListeners('destroyed');
+          });
+        });
+      });
+
+      it('#239 test prefixed db', function () {
+        var destroyedDBs = [];
+        Pouch.on('destroyed', function (db) {
+          destroyedDBs.push(db);
+        });
+
+        // make sure prefixed DBs are tied to regular DBs
+        var db = new Pouch(dbName, {prefix: 'myprefix_'});
+        return utils.fin(createView(db, {
+          map: function (doc) {
+            emit(doc.name);
+          }
+        }).then(function (queryFun) {
+          return db.post({name: 'foo'}).then(function () {
+            return db.query(queryFun);
+          }).then(function (res) {
+            res.rows.should.have.length(1);
+            res.rows[0].key.should.equal('foo');
+            var ddocId = '_design/' + queryFun.split('/')[0];
+            return db.get(ddocId);
+          }).then(function (ddoc) {
+            return db.remove(ddoc);
+          }).then(function () {
+            return db.viewCleanup();
+          });
+        }), function () {
+          return db.destroy().then(function () {
+            var chain = Pouch.utils.Promise.resolve();
+            // for each of the supposedly destroyed DBs,
+            // check that there isn't a normal DB hanging around
+            destroyedDBs.forEach(function (dbName) {
+              chain = chain.then(function () {
+                var db = new Pouch(dbName);
+                var promise = db.info().then(function (info) {
+                  info.update_seq.should.equal(0);
+                });
+                return utils.fin(promise, function () {
+                  return db.destroy();
+                });
+              });
+            });
+            return chain;
+          }).then(function () {
+            Pouch.removeAllListeners('destroyed');
+          });
+        });
+      });
+    }
+
   });
 }
