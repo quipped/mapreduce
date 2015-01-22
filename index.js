@@ -420,7 +420,7 @@ function updateViewInQueue(view) {
       view.sourceDB.changes({
         conflicts: true,
         include_docs: true,
-        quio_model: quio_model
+        quio_model: quio_model,
         since: currentSeq,
         limit: CHANGES_BATCH_SIZE
       }).on('complete', function (response) {

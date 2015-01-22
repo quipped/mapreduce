@@ -77,7 +77,7 @@ module.exports = function (opts) {
   });
 };
 
-},{"./upsert":31,"./utils":32}],2:[function(require,module,exports){
+},{"./upsert":32,"./utils":33}],2:[function(require,module,exports){
 'use strict';
 
 module.exports = function (func, emit, sum, log, isArray, toJSON) {
@@ -104,7 +104,7 @@ if ((typeof console !== 'undefined') && (typeof console.log === 'function')) {
 }
 var utils = require('./utils');
 var Promise = utils.Promise;
-var mainQueue = new TaskQueue();
+var persistentQueues = {};
 var tempViewQueue = new TaskQueue();
 var CHANGES_BATCH_SIZE = 50;
 
@@ -435,13 +435,28 @@ function saveKeyValues(view, docIdsToEmits, seq) {
   });
 }
 
-var updateView = utils.sequentialize(mainQueue, function (view) {
+function getQueue(view) {
+  var viewName = typeof view === 'string' ? view : view.name;
+  var queue = persistentQueues[viewName];
+  if (!queue) {
+    queue = persistentQueues[viewName] = new TaskQueue();
+  }
+  return queue;
+}
+
+function updateView(view) {
+  return utils.sequentialize(getQueue(view), function () {
+    return updateViewInQueue(view);
+  })();
+}
+
+function updateViewInQueue(view) {
   // bind the emit function once
   var mapResults;
   var doc;
 
   function emit(key, value) {
-    var output = { id: doc._id, key: normalizeKey(key) };
+    var output = {id: doc._id, key: normalizeKey(key)};
     // Don't explicitly store the value unless it's defined and non-null.
     // This saves on storage space, because often people don't use it.
     if (typeof value !== 'undefined' && value !== null) {
@@ -468,6 +483,7 @@ var updateView = utils.sequentialize(mainQueue, function (view) {
       return saveKeyValues(view, docIdsToEmits, seq);
     };
   }
+
   var queue = new TaskQueue();
   // TODO(neojski): https://github.com/daleharvey/pouchdb/issues/1521
 
@@ -492,9 +508,9 @@ var updateView = utils.sequentialize(mainQueue, function (view) {
       view.sourceDB.changes({
         conflicts: true,
         include_docs: true,
-        since : currentSeq,
-        limit : CHANGES_BATCH_SIZE,
-        quio_model: quio_model
+        quio_model: quio_model,
+        since: currentSeq,
+        limit: CHANGES_BATCH_SIZE
       }).on('complete', function (response) {
         var results = response.results;
         if (!results.length) {
@@ -539,9 +555,10 @@ var updateView = utils.sequentialize(mainQueue, function (view) {
         reject(err);
       }
     }
+
     processNextBatch();
   });
-});
+}
 
 function reduceView(view, results, options) {
   if (options.group_level === 0) {
@@ -589,7 +606,13 @@ function reduceView(view, results, options) {
   return {rows: sliceResults(groups, options.limit, options.skip)};
 }
 
-var queryView = utils.sequentialize(mainQueue, function (view, opts) {
+function queryView(view, opts) {
+  return utils.sequentialize(getQueue(view), function () {
+    return queryViewInQueue(view, opts);
+  })();
+}
+
+function queryViewInQueue(view, opts) {
   var totalRows;
   var shouldReduce = view.reduceFun && opts.reduce !== false;
   var skip = opts.skip || 0;
@@ -722,7 +745,7 @@ var queryView = utils.sequentialize(mainQueue, function (view, opts) {
     }
     return fetchFromView(viewOpts).then(onMapResultsReady);
   }
-});
+}
 
 function httpViewCleanup(db) {
   return db.request({
@@ -731,7 +754,7 @@ function httpViewCleanup(db) {
   });
 }
 
-var localViewCleanup = utils.sequentialize(mainQueue, function (db) {
+function localViewCleanup(db) {
   return db.get('_local/mrviews').then(function (metaDoc) {
     var docsToViews = {};
     Object.keys(metaDoc.views).forEach(function (fullViewName) {
@@ -769,14 +792,16 @@ var localViewCleanup = utils.sequentialize(mainQueue, function (db) {
         return !viewsToStatus[viewDBName];
       });
       var destroyPromises = dbsToDelete.map(function (viewDBName) {
-        return db.constructor.destroy(viewDBName, {adapter : db.adapter});
+        return utils.sequentialize(getQueue(viewDBName), function () {
+          return db.constructor.destroy(viewDBName, db.__opts);
+        })();
       });
       return Promise.all(destroyPromises).then(function () {
         return {ok: true};
       });
     });
   }, defaultsTo({ok: true}));
-});
+}
 
 exports.viewCleanup = utils.callbackify(function () {
   var db = this;
@@ -895,7 +920,7 @@ function NotFoundError(message) {
 
 utils.inherits(NotFoundError, Error);
 
-},{"./create-view":1,"./evalfunc":2,"./taskqueue":30,"./utils":32,"__browserify_process":6,"pouchdb-collate":26}],4:[function(require,module,exports){
+},{"./create-view":1,"./evalfunc":2,"./taskqueue":31,"./utils":33,"__browserify_process":6,"pouchdb-collate":26}],4:[function(require,module,exports){
 'use strict';
 
 module.exports = argsArray;
@@ -2068,6 +2093,102 @@ module.exports = extend;
 
 
 },{}],29:[function(require,module,exports){
+var global=typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {};'use strict';
+
+var PouchPromise;
+/* istanbul ignore next */
+if (typeof window !== 'undefined' && window.PouchDB) {
+  PouchPromise = window.PouchDB.utils.Promise;
+} else {
+  PouchPromise = typeof global.Promise === 'function' ? global.Promise : require('lie');
+}
+
+// this is essentially the "update sugar" function from daleharvey/pouchdb#1388
+// the diffFun tells us what delta to apply to the doc.  it either returns
+// the doc, or false if it doesn't need to do an update after all
+function upsertInner(db, docId, diffFun) {
+  return new PouchPromise(function (fulfill, reject) {
+    if (typeof docId !== 'string') {
+      return reject(new Error('doc id is required'));
+    }
+
+    db.get(docId, function (err, doc) {
+      if (err) {
+        /* istanbul ignore next */
+        if (err.status !== 404) {
+          return reject(err);
+        }
+        doc = {};
+      }
+      var newDoc = diffFun(doc);
+      if (!newDoc) {
+        return fulfill({updated: false, rev: doc._rev});
+      }
+      newDoc._id = docId;
+      newDoc._rev = doc._rev;
+      fulfill(tryAndPut(db, newDoc, diffFun));
+    });
+  });
+}
+
+function tryAndPut(db, doc, diffFun) {
+  return db.put(doc).then(function (res) {
+    return {
+      updated: true,
+      rev: res.rev
+    };
+  }, function (err) {
+    /* istanbul ignore next */
+    if (err.status !== 409) {
+      throw err;
+    }
+    return upsertInner(db, doc._id, diffFun);
+  });
+}
+
+exports.upsert = function upsert(docId, diffFun, cb) {
+  var db = this;
+  var promise = upsertInner(db, docId, diffFun);
+  if (typeof cb !== 'function') {
+    return promise;
+  }
+  promise.then(function (resp) {
+    cb(null, resp);
+  }, cb);
+};
+
+exports.putIfNotExists = function putIfNotExists(docId, doc, cb) {
+  var db = this;
+
+  if (typeof docId !== 'string') {
+    cb = doc;
+    doc = docId;
+    docId = doc._id;
+  }
+
+  var diffFun = function (existingDoc) {
+    if (existingDoc._rev) {
+      return false; // do nothing
+    }
+    return doc;
+  };
+
+  var promise = upsertInner(db, docId, diffFun);
+  if (typeof cb !== 'function') {
+    return promise;
+  }
+  promise.then(function (resp) {
+    cb(null, resp);
+  }, cb);
+};
+
+
+/* istanbul ignore next */
+if (typeof window !== 'undefined' && window.PouchDB) {
+  window.PouchDB.plugin(exports);
+}
+
+},{"lie":11}],30:[function(require,module,exports){
 /*jshint bitwise:false*/
 /*global unescape*/
 
@@ -2668,7 +2789,7 @@ module.exports = extend;
     return SparkMD5;
 }));
 
-},{}],30:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 'use strict';
 /*
  * Simple task queue to sequentialize actions. Assumes callbacks will eventually fire (once).
@@ -2693,50 +2814,15 @@ TaskQueue.prototype.finish = function () {
 
 module.exports = TaskQueue;
 
-},{"./utils":32}],31:[function(require,module,exports){
+},{"./utils":33}],32:[function(require,module,exports){
 'use strict';
-var Promise = require('./utils').Promise;
 
-// this is essentially the "update sugar" function from daleharvey/pouchdb#1388
-// the diffFun tells us what delta to apply to the doc.  it either returns
-// the doc, or false if it doesn't need to do an update after all
-function upsert(db, docId, diffFun) {
-  return new Promise(function (fulfill, reject) {
-    if (docId && typeof docId === 'object') {
-      docId = docId._id;
-    }
-    if (typeof docId !== 'string') {
-      return reject(new Error('doc id is required'));
-    }
+var upsert = require('pouchdb-upsert').upsert;
 
-    db.get(docId, function (err, doc) {
-      if (err) {
-        if (err.status !== 404) {
-          return reject(err);
-        }
-        return fulfill(tryAndPut(db, diffFun({_id : docId}), diffFun));
-      }
-      var newDoc = diffFun(doc);
-      if (!newDoc) {
-        return fulfill(doc);
-      }
-      fulfill(tryAndPut(db, newDoc, diffFun));
-    });
-  });
-}
-
-function tryAndPut(db, doc, diffFun) {
-  return db.put(doc)["catch"](function (err) {
-    if (err.status !== 409) {
-      throw err;
-    }
-    return upsert(db, doc, diffFun);
-  });
-}
-
-module.exports = upsert;
-
-},{"./utils":32}],32:[function(require,module,exports){
+module.exports = function (db, doc, diffFun) {
+  return upsert.apply(db, [doc, diffFun]);
+};
+},{"pouchdb-upsert":29}],33:[function(require,module,exports){
 var process=require("__browserify_process"),global=typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {};'use strict';
 /* istanbul ignore if */
 if (typeof global.Promise === 'function') {
@@ -2835,7 +2921,7 @@ exports.MD5 = function (string) {
     return Md5.hash(string);
   }
 };
-},{"__browserify_process":6,"argsarray":4,"crypto":5,"inherits":7,"lie":11,"pouchdb-extend":28,"spark-md5":29}]},{},[3])
+},{"__browserify_process":6,"argsarray":4,"crypto":5,"inherits":7,"lie":11,"pouchdb-extend":28,"spark-md5":30}]},{},[3])
 (3)
 });
 ;
